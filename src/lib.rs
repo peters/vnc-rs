@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! # VNC-RS
 //!
 //! ## Description
@@ -29,7 +31,6 @@
 //!     let tcp = TcpStream::connect("127.0.0.1:5900").await?;
 //!     let vnc = VncConnector::new(tcp)
 //!         .set_auth_method(async move { Ok("123".to_string()) })
-//!         .add_encoding(vnc::VncEncoding::Tight)
 //!         .add_encoding(vnc::VncEncoding::Zrle)
 //!         .add_encoding(vnc::VncEncoding::CopyRect)
 //!         .add_encoding(vnc::VncEncoding::Raw)
@@ -212,6 +213,7 @@ mod codec;
 pub mod config;
 pub mod error;
 pub mod event;
+mod limits;
 
 pub use client::VncClient;
 pub use client::VncConnector;

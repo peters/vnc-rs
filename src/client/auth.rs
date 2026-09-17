@@ -24,9 +24,18 @@ impl TryFrom<u8> for SecurityType {
     type Error = VncError;
     fn try_from(num: u8) -> Result<Self, Self::Error> {
         match num {
-            0 | 1 | 2 | 5 | 6 | 16 | 17 | 18 | 19 | 20 | 21 | 22 => {
-                Ok(unsafe { std::mem::transmute::<u8, SecurityType>(num) })
-            }
+            0 => Ok(Self::Invalid),
+            1 => Ok(Self::None),
+            2 => Ok(Self::VncAuth),
+            5 => Ok(Self::RA2),
+            6 => Ok(Self::RA2ne),
+            16 => Ok(Self::Tight),
+            17 => Ok(Self::Ultra),
+            18 => Ok(Self::Tls),
+            19 => Ok(Self::VeNCrypt),
+            20 => Ok(Self::GtkVncSasl),
+            21 => Ok(Self::Md5Hash),
+            22 => Ok(Self::ColinDeanXvp),
             invalid => Err(VncError::InvalidSecurityTyep(invalid)),
         }
     }
@@ -46,11 +55,12 @@ impl SecurityType {
         match version {
             VncVersion::RFB33 => {
                 let security_type = reader.read_u32().await?;
+                if security_type > 2 {
+                    return Err(VncError::ConnectError);
+                }
                 let security_type = (security_type as u8).try_into()?;
                 if let SecurityType::Invalid = security_type {
-                    let _ = reader.read_u32().await?;
-                    let mut err_msg = String::new();
-                    reader.read_to_string(&mut err_msg).await?;
+                    let err_msg = crate::limits::string(reader, crate::limits::MAX_NAME).await?;
                     return Err(VncError::General(err_msg));
                 }
                 Ok(vec![security_type])
@@ -66,14 +76,15 @@ impl SecurityType {
                 let num = reader.read_u8().await?;
 
                 if num == 0 {
-                    let _ = reader.read_u32().await?;
-                    let mut err_msg = String::new();
-                    reader.read_to_string(&mut err_msg).await?;
+                    let err_msg = crate::limits::string(reader, crate::limits::MAX_NAME).await?;
                     return Err(VncError::General(err_msg));
                 }
                 let mut sec_types = vec![];
                 for _ in 0..num {
-                    sec_types.push(reader.read_u8().await?.try_into()?);
+                    // Ignore unfamiliar advertised mechanisms; only choose a known one.
+                    if let Ok(kind) = reader.read_u8().await?.try_into() {
+                        sec_types.push(kind);
+                    }
                 }
                 tracing::trace!("Server supported security type: {:?}", sec_types);
                 Ok(sec_types)
@@ -91,15 +102,23 @@ impl SecurityType {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub(super) enum AuthResult {
     Ok = 0,
     Failed = 1,
 }
 
-impl From<u32> for AuthResult {
-    fn from(num: u32) -> Self {
-        unsafe { std::mem::transmute(num) }
+impl TryFrom<u32> for AuthResult {
+    type Error = VncError;
+    fn try_from(num: u32) -> Result<Self, VncError> {
+        match num {
+            0 => Ok(Self::Ok),
+            1 => Ok(Self::Failed),
+            _ => Err(VncError::General(
+                "Invalid VNC authentication result".into(),
+            )),
+        }
     }
 }
 
@@ -154,6 +173,6 @@ impl AuthHelper {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let result = reader.read_u32().await?;
-        Ok(result.into())
+        result.try_into()
     }
 }

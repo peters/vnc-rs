@@ -18,12 +18,10 @@ pub enum VncEncoding {
     LastRectPseudo = -224,
 }
 
-impl From<u32> for VncEncoding {
-    fn from(num: u32) -> Self {
-        // Safe match instead of transmute — unknown encoding IDs fall back to Raw
-        // instead of causing UB (the original transmute is unsound for any value
-        // not matching a valid discriminant).
-        match num as i32 {
+impl TryFrom<u32> for VncEncoding {
+    type Error = VncError;
+    fn try_from(num: u32) -> Result<Self, VncError> {
+        Ok(match num as i32 {
             0 => VncEncoding::Raw,
             1 => VncEncoding::CopyRect,
             7 => VncEncoding::Tight,
@@ -32,8 +30,21 @@ impl From<u32> for VncEncoding {
             -239 => VncEncoding::CursorPseudo,
             -223 => VncEncoding::DesktopSizePseudo,
             -224 => VncEncoding::LastRectPseudo,
-            _ => VncEncoding::Raw,
-        }
+            _ => return Err(VncError::InvalidImageData),
+        })
+    }
+}
+
+impl VncEncoding {
+    pub(crate) fn qualified(self) -> bool {
+        matches!(
+            self,
+            Self::Raw
+                | Self::CopyRect
+                | Self::Zrle
+                | Self::DesktopSizePseudo
+                | Self::LastRectPseudo
+        )
     }
 }
 
@@ -186,8 +197,8 @@ impl TryFrom<[u8; 16]> for PixelFormat {
             return Err(VncError::WrongPixelFormat);
         }
         let depth = pf[1];
-        let big_endian_flag = pf[2];
-        let true_color_flag = pf[3];
+        let big_endian_flag = u8::from(pf[2] != 0);
+        let true_color_flag = u8::from(pf[3] != 0);
         let red_max = u16::from_be_bytes(pf[4..6].try_into().unwrap());
         let green_max = u16::from_be_bytes(pf[6..8].try_into().unwrap());
         let blue_max = u16::from_be_bytes(pf[8..10].try_into().unwrap());
@@ -197,7 +208,7 @@ impl TryFrom<[u8; 16]> for PixelFormat {
         let _padding_1 = pf[13];
         let _padding_2 = pf[14];
         let _padding_3 = pf[15];
-        Ok(PixelFormat {
+        let format = PixelFormat {
             bits_per_pixel,
             depth,
             big_endian_flag,
@@ -211,7 +222,9 @@ impl TryFrom<[u8; 16]> for PixelFormat {
             _padding_1,
             _padding_2,
             _padding_3,
-        })
+        };
+        format.validate()?;
+        Ok(format)
     }
 }
 
@@ -238,6 +251,36 @@ impl Default for PixelFormat {
 }
 
 impl PixelFormat {
+    pub(crate) fn validate(&self) -> Result<(), VncError> {
+        if !matches!(self.bits_per_pixel, 8 | 16 | 32)
+            || self.depth == 0
+            || self.depth > self.bits_per_pixel
+            || self.big_endian_flag > 1
+            || self.true_color_flag > 1
+        {
+            return Err(VncError::WrongPixelFormat);
+        }
+        if self.true_color_flag == 1 {
+            let mut mask = 0u64;
+            for (max, shift) in [
+                (self.red_max, self.red_shift),
+                (self.green_max, self.green_shift),
+                (self.blue_max, self.blue_shift),
+            ] {
+                let max = u64::from(max);
+                if max == 0 || max & (max + 1) != 0 || shift >= self.bits_per_pixel {
+                    return Err(VncError::WrongPixelFormat);
+                }
+                let component = max << shift;
+                if component >= (1u64 << self.bits_per_pixel) || component & mask != 0 {
+                    return Err(VncError::WrongPixelFormat);
+                }
+                mask |= component;
+            }
+        }
+        Ok(())
+    }
+
     // (a << 24 | r << 16 || g << 8 | b) in le
     // [b, g, r, a] in network
     pub fn bgra() -> PixelFormat {
@@ -261,5 +304,31 @@ impl PixelFormat {
         let mut pixel_buffer = [0_u8; 16];
         reader.read_exact(&mut pixel_buffer).await?;
         pixel_buffer.try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PixelFormat;
+
+    #[test]
+    fn x11vnc_nonzero_wire_flags_are_normalized() {
+        let bytes = [32, 24, 0, 255, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0];
+        let format = PixelFormat::try_from(bytes).unwrap();
+        assert_eq!(format.true_color_flag, 1);
+        assert_eq!(format.big_endian_flag, 0);
+        assert_eq!(
+            (format.red_shift, format.green_shift, format.blue_shift),
+            (16, 8, 0)
+        );
+        let mut big_endian = bytes;
+        big_endian[2] = 255;
+        assert_eq!(
+            PixelFormat::try_from(big_endian).unwrap().big_endian_flag,
+            1
+        );
+        let mut invalid_shift = bytes;
+        invalid_shift[10] = 32;
+        assert!(PixelFormat::try_from(invalid_shift).is_err());
     }
 }

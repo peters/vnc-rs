@@ -1,15 +1,17 @@
 use futures::TryStreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use std::{future::Future, sync::Arc, vec};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{
-        mpsc::{
-            channel,
-            error::{TryRecvError, TrySendError},
-            Receiver, Sender,
-        },
+        mpsc::{channel, error::TryRecvError, Receiver, Sender},
         oneshot, Mutex,
     },
 };
@@ -17,7 +19,7 @@ use tokio_util::compat::*;
 use tracing::*;
 
 use crate::{codec, PixelFormat, Rect, VncEncoding, VncError, VncEvent, X11Event};
-const CHANNEL_SIZE: usize = 4096;
+const CHANNEL_SIZE: usize = 2;
 
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::spawn;
@@ -31,9 +33,10 @@ struct ImageRect {
     encoding: VncEncoding,
 }
 
-impl From<[u8; 12]> for ImageRect {
-    fn from(buf: [u8; 12]) -> Self {
-        Self {
+impl TryFrom<[u8; 12]> for ImageRect {
+    type Error = VncError;
+    fn try_from(buf: [u8; 12]) -> Result<Self, VncError> {
+        Ok(Self {
             rect: Rect {
                 x: ((buf[0] as u16) << 8) | buf[1] as u16,
                 y: ((buf[2] as u16) << 8) | buf[3] as u16,
@@ -44,8 +47,8 @@ impl From<[u8; 12]> for ImageRect {
                 | ((buf[9] as u32) << 16)
                 | ((buf[10] as u32) << 8)
                 | (buf[11] as u32))
-                .into(),
-        }
+                .try_into()?,
+        })
     }
 }
 
@@ -56,13 +59,13 @@ impl ImageRect {
     {
         let mut rect_buf = [0_u8; 12];
         reader.read_exact(&mut rect_buf).await?;
-        Ok(rect_buf.into())
+        rect_buf.try_into()
     }
 }
 
 struct VncInner {
     name: String,
-    screen: (u16, u16),
+    screen: Arc<AtomicU32>,
     input_ch: Sender<ClientMsg>,
     output_ch: Receiver<VncEvent>,
     decoding_stop: Option<oneshot::Sender<()>>,
@@ -99,8 +102,10 @@ impl VncInner {
             })
             .await?;
 
+        let screen = Arc::new(AtomicU32::new((u32::from(width) << 16) | u32::from(height)));
+        let decoder_screen = Arc::clone(&screen);
         trace!("client encodings: {:?}", encodings);
-        send_client_encoding(&mut stream, encodings).await?;
+        send_client_encoding(&mut stream, encodings.clone()).await?;
 
         trace!("Require the first frame");
         input_ch_tx
@@ -129,9 +134,11 @@ impl VncInner {
             };
 
             let pf = pixel_format.as_ref().unwrap();
-            if let Err(e) =
-                asycn_vnc_read_loop(&mut conn_ch_rx, pf, &output_func, decoding_stop_rx).await
-            {
+            let result = tokio::select! {
+                _ = decoding_stop_rx => Ok(()),
+                result = asycn_vnc_read_loop(&mut conn_ch_rx, pf, &output_func, &encodings, &decoder_screen) => result,
+            };
+            if let Err(e) = result {
                 if let VncError::IoError(e) = e {
                     if let std::io::ErrorKind::UnexpectedEof = e.kind() {
                         // this should be a normal case when the network connection disconnects
@@ -139,11 +146,11 @@ impl VncInner {
                         // do nothing here
                     } else {
                         error!("Error occurs during the decoding {:?}", e);
-                        let _ = output_func(VncEvent::Error(e.to_string())).await;
+                        let _ = output_ch_tx.try_send(VncEvent::Error(e.to_string()));
                     }
                 } else {
                     error!("Error occurs during the decoding {:?}", e);
-                    let _ = output_func(VncEvent::Error(e.to_string())).await;
+                    let _ = output_ch_tx.try_send(VncEvent::Error(e.to_string()));
                 }
             }
             trace!("Decoding thread stops");
@@ -161,7 +168,7 @@ impl VncInner {
         info!("VNC Client {name} starts");
         Ok(Self {
             name,
-            screen: (width, height),
+            screen,
             input_ch: input_ch_tx,
             output_ch: output_ch_rx,
             decoding_stop: Some(decoding_stop_tx),
@@ -174,13 +181,15 @@ impl VncInner {
         if self.closed {
             Err(VncError::ClientNotRunning)
         } else {
+            let dimensions = self.screen.load(Ordering::Acquire);
+            let screen = ((dimensions >> 16) as u16, dimensions as u16);
             let msg = match event {
                 X11Event::Refresh => ClientMsg::FramebufferUpdateRequest(
                     Rect {
                         x: 0,
                         y: 0,
-                        width: self.screen.0,
-                        height: self.screen.1,
+                        width: screen.0,
+                        height: screen.1,
                     },
                     1,
                 ),
@@ -188,8 +197,8 @@ impl VncInner {
                     Rect {
                         x: 0,
                         y: 0,
-                        width: self.screen.0,
-                        height: self.screen.1,
+                        width: screen.0,
+                        height: screen.1,
                     },
                     0, // non-incremental: server sends entire framebuffer
                 ),
@@ -197,7 +206,12 @@ impl VncInner {
                 X11Event::PointerEvent(mouse) => {
                     ClientMsg::PointerEvent(mouse.position_x, mouse.position_y, mouse.bottons)
                 }
-                X11Event::CopyText(text) => ClientMsg::ClientCutText(text),
+                X11Event::CopyText(text) => {
+                    if text.len() > crate::limits::MAX_TEXT {
+                        return Err(VncError::InvalidImageData);
+                    }
+                    ClientMsg::ClientCutText(text)
+                }
             };
             self.input_ch.send(msg).await?;
             Ok(())
@@ -343,6 +357,7 @@ where
 
     let screen_width = stream.read_u16().await?;
     let screen_height = stream.read_u16().await?;
+    crate::limits::dimensions(screen_width, screen_height)?;
     let mut send_our_pf = false;
 
     output_func(VncEvent::SetResolution(
@@ -352,16 +367,16 @@ where
 
     let pixel_format = PixelFormat::read(stream).await?;
     if pf.is_none() {
+        if pixel_format.true_color_flag != 1 {
+            return Err(VncError::WrongPixelFormat);
+        }
         output_func(VncEvent::SetPixelFormat(pixel_format)).await?;
         let _ = pf.insert(pixel_format);
     } else {
         send_our_pf = true;
     }
 
-    let name_len = stream.read_u32().await?;
-    let mut name_buf = vec![0_u8; name_len as usize];
-    stream.read_exact(&mut name_buf).await?;
-    let name = String::from_utf8_lossy(&name_buf).into_owned();
+    let name = crate::limits::string(stream, crate::limits::MAX_NAME).await?;
 
     if send_our_pf {
         trace!("Send customized pixel format {:#?}", pf);
@@ -387,7 +402,8 @@ async fn asycn_vnc_read_loop<S, F, Fut>(
     stream: &mut S,
     pf: &PixelFormat,
     output_func: &F,
-    mut stop_ch: oneshot::Receiver<()>,
+    encodings: &[VncEncoding],
+    screen: &AtomicU32,
 ) -> Result<(), VncError>
 where
     S: AsyncRead + Unpin,
@@ -396,20 +412,29 @@ where
 {
     let mut raw_decoder = codec::RawDecoder::new();
     let mut zrle_decoder = codec::ZrleDecoder::new();
-    let mut tight_decoder = codec::TightDecoder::new();
-    let mut trle_decoder = codec::TrleDecoder::new();
-    let mut cursor = codec::CursorDecoder::new();
 
     // main decoding loop
-    while let Err(oneshot::error::TryRecvError::Empty) = stop_ch.try_recv() {
+    loop {
         let server_msg = ServerMsg::read(stream).await?;
         trace!("Server message got: {:?}", server_msg);
         match server_msg {
             ServerMsg::FramebufferUpdate(rect_num) => {
                 for _ in 0..rect_num {
                     let rect = ImageRect::read(stream).await?;
-                    // trace!("Encoding: {:?}", rect.encoding);
-
+                    if !rect.encoding.qualified()
+                        || (rect.encoding != VncEncoding::Raw
+                            && !encodings.contains(&rect.encoding))
+                    {
+                        return Err(VncError::InvalidImageData);
+                    }
+                    let size = screen.load(Ordering::Acquire);
+                    let dimensions = ((size >> 16) as u16, size as u16);
+                    if !matches!(
+                        rect.encoding,
+                        VncEncoding::DesktopSizePseudo | VncEncoding::LastRectPseudo
+                    ) {
+                        crate::limits::rectangle(&rect.rect, dimensions)?;
+                    }
                     match rect.encoding {
                         VncEncoding::Raw => {
                             raw_decoder
@@ -422,27 +447,23 @@ where
                             let mut src_rect = rect.rect;
                             src_rect.x = source_x;
                             src_rect.y = source_y;
+                            crate::limits::rectangle(&src_rect, dimensions)?;
                             output_func(VncEvent::Copy(rect.rect, src_rect)).await?;
-                        }
-                        VncEncoding::Tight => {
-                            tight_decoder
-                                .decode(pf, &rect.rect, stream, output_func)
-                                .await?;
-                        }
-                        VncEncoding::Trle => {
-                            trle_decoder
-                                .decode(pf, &rect.rect, stream, output_func)
-                                .await?;
                         }
                         VncEncoding::Zrle => {
                             zrle_decoder
                                 .decode(pf, &rect.rect, stream, output_func)
                                 .await?;
                         }
-                        VncEncoding::CursorPseudo => {
-                            cursor.decode(pf, &rect.rect, stream, output_func).await?;
-                        }
                         VncEncoding::DesktopSizePseudo => {
+                            crate::limits::dimensions(rect.rect.width, rect.rect.height)?;
+                            if rect.rect.x != 0 || rect.rect.y != 0 {
+                                return Err(VncError::InvalidImageData);
+                            }
+                            screen.store(
+                                (u32::from(rect.rect.width) << 16) | u32::from(rect.rect.height),
+                                Ordering::Release,
+                            );
                             output_func(VncEvent::SetResolution(
                                 (rect.rect.width, rect.rect.height).into(),
                             ))
@@ -451,6 +472,7 @@ where
                         VncEncoding::LastRectPseudo => {
                             break;
                         }
+                        _ => return Err(VncError::InvalidImageData),
                     }
                 }
             }
@@ -463,7 +485,6 @@ where
             }
         }
     }
-    Ok(())
 }
 
 async fn async_connection_process_loop<S>(
@@ -478,51 +499,36 @@ where
     let mut buffer = [0; 65535];
     let mut pending = 0;
 
-    // main traffic loop
     loop {
-        if pending > 0 {
-            match conn_ch.try_send(Ok(buffer[0..pending].to_owned())) {
-                Err(TrySendError::Full(_message)) => (),
-                Err(TrySendError::Closed(_message)) => break,
-                Ok(()) => pending = 0,
-            }
-        }
-
         tokio::select! {
             _ = &mut stop_ch => break,
-            result = stream.read(&mut buffer), if pending == 0 => {
-                match result {
-                    Ok(nread) => {
-                        if nread > 0 {
-                            match conn_ch.try_send(Ok(buffer[0..nread].to_owned())) {
-                                Err(TrySendError::Full(_message)) => pending = nread,
-                                Err(TrySendError::Closed(_message)) => break,
-                                Ok(()) => ()
-                            }
-                        } else {
-                            // According to the tokio's Doc
-                            // https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html
-                            // if nread == 0, then EOF is reached
-                            trace!("Net Connection EOF detected");
-                            break;
-                        }
+            permit = conn_ch.reserve(), if pending > 0 => {
+                match permit {
+                    Ok(permit) => {
+                        permit.send(Ok(buffer[..pending].to_vec()));
+                        pending = 0;
                     }
-                    Err(e) => {
-                        error!("{}", e.to_string());
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
-            Some(msg) = input_ch.recv() => {
-                msg.write(&mut stream).await?;
+            result = stream.read(&mut buffer), if pending == 0 => {
+                match result {
+                    Ok(0) | Err(_) => break,
+                    Ok(length) => pending = length,
+                }
+            }
+            message = input_ch.recv() => {
+                let Some(message) = message else { break; };
+                tokio::select! {
+                    _ = &mut stop_ch => break,
+                    result = message.write(&mut stream) => result?,
+                }
             }
         }
     }
-
-    // notify the decoding thread
-    let _ = conn_ch
-        .send(Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)))
-        .await;
-
+    // Dropping the bridge signals EOF without blocking shutdown on a full queue.
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

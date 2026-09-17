@@ -1,6 +1,7 @@
 [package]
 name = "vnc-rs"
 version = "0.5.3"
+publish = false
 edition = "2021"
 authors  = ["Jovi Hsu <jv.hsu@outlook.com>", "Petr Beneš <petr.benes@gendigital.com>", "Djamel TORCHE <djamel.torche@gmail.com>"]
 license = "MIT OR Apache-2.0"
