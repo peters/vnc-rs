@@ -4,7 +4,7 @@ use crate::{VncConnector, VncVersion};
 use std::time::Duration;
 use tokio::io::{duplex, DuplexStream};
 
-async fn handshake(server: &mut DuplexStream, size: (u16, u16)) {
+pub(super) async fn handshake(server: &mut DuplexStream, size: (u16, u16)) {
     handshake_auth(server, size, false).await;
 }
 
@@ -56,7 +56,7 @@ async fn handshake_auth(server: &mut DuplexStream, size: (u16, u16), password: b
     assert_eq!(request[0], 3);
 }
 
-async fn connect(stream: DuplexStream) -> VncClient {
+pub(super) async fn connect(stream: DuplexStream) -> VncClient {
     VncConnector::new(stream)
         .set_auth_method(async { Ok("test".to_string()) })
         .set_pixel_format(PixelFormat::rgba())
@@ -73,14 +73,14 @@ async fn connect(stream: DuplexStream) -> VncClient {
         .unwrap()
 }
 
-async fn event(client: &VncClient) -> VncEvent {
+pub(super) async fn event(client: &VncClient) -> VncEvent {
     tokio::time::timeout(Duration::from_secs(2), client.recv_event())
         .await
         .unwrap()
         .unwrap()
 }
 
-fn rect_header(rect: Rect, encoding: u32) -> Vec<u8> {
+pub(super) fn rect_header(rect: Rect, encoding: u32) -> Vec<u8> {
     let mut bytes = vec![0, 0, 0, 1];
     for value in [rect.x, rect.y, rect.width, rect.height] {
         bytes.extend(value.to_be_bytes());

@@ -16,6 +16,7 @@ pub enum VncEncoding {
     CursorPseudo = -239,
     DesktopSizePseudo = -223,
     LastRectPseudo = -224,
+    ExtendedDesktopSizePseudo = -308,
 }
 
 impl TryFrom<u32> for VncEncoding {
@@ -30,6 +31,7 @@ impl TryFrom<u32> for VncEncoding {
             -239 => VncEncoding::CursorPseudo,
             -223 => VncEncoding::DesktopSizePseudo,
             -224 => VncEncoding::LastRectPseudo,
+            -308 => VncEncoding::ExtendedDesktopSizePseudo,
             _ => return Err(VncError::InvalidImageData),
         })
     }
@@ -44,6 +46,7 @@ impl VncEncoding {
                 | Self::Zrle
                 | Self::DesktopSizePseudo
                 | Self::LastRectPseudo
+                | Self::ExtendedDesktopSizePseudo
         )
     }
 }
