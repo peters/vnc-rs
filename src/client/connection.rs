@@ -498,8 +498,8 @@ where
                             if index != 0 {
                                 return Err(VncError::InvalidImageData);
                             }
-                            let mut updates =
-                                vec![crate::DesktopUpdate::read(stream, rect.rect).await?];
+                            let mut updates = crate::desktop::UpdateBatch::default();
+                            updates.push(crate::DesktopUpdate::read(stream, rect.rect).await?)?;
                             for _ in 1..rect_num {
                                 let next = ImageRect::read(stream).await?;
                                 if next.encoding == VncEncoding::LastRectPseudo
@@ -507,14 +507,13 @@ where
                                 {
                                     break;
                                 }
-                                if next.encoding != VncEncoding::ExtendedDesktopSizePseudo
-                                    || updates.len() >= 16
-                                {
+                                if next.encoding != VncEncoding::ExtendedDesktopSizePseudo {
                                     return Err(VncError::InvalidImageData);
                                 }
-                                updates.push(crate::DesktopUpdate::read(stream, next.rect).await?);
+                                updates
+                                    .push(crate::DesktopUpdate::read(stream, next.rect).await?)?;
                             }
-                            for update in updates {
+                            for update in updates.into_updates() {
                                 if let Some(layout) = &update.layout {
                                     screen.store(
                                         (u32::from(layout.width) << 16) | u32::from(layout.height),
