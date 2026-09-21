@@ -37,8 +37,9 @@ Hard limits are 8,294,400 pixels per framebuffer, dimensions at most 8192, 64 Mi
 per compressed rectangle, 1 MiB per clipboard message, and 4096 bytes per desktop
 name or authentication failure reason. A valid server exceeding a limit is
 rejected. These are per-connection limits, not a total application memory budget.
-Two-item queues bound pending network packets, input commands and decoded events;
-a raw image event may contain a whole bounded framebuffer.
+The network and input queues each hold up to 4096 items; the decoded-event queue
+holds two. A raw image event may contain a whole bounded framebuffer. These queue
+limits do not establish a total memory budget.
 
 ## Changes
 
@@ -60,8 +61,8 @@ a raw image event may contain a whole bounded framebuffer.
   forever for unrelated input after the channel was full.
 - Allow shutdown to interrupt socket writes, reads and blocked decoded-event
   delivery. Drop the network bridge to signal EOF without blocking shutdown.
-- Preserve decoder error details when an output slot is available; if the queue
-  is full, pending events drain before `ClientNotRunning` reports termination.
+- Preserve decoder error details by waiting for output capacity; shutdown can
+  cancel that wait. Release the network bridge before waiting to deliver errors.
 
 ## Regression checks
 
