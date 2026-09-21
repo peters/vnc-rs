@@ -9,6 +9,10 @@ pub(super) async fn handshake(server: &mut DuplexStream, size: (u16, u16)) {
 }
 
 async fn handshake_auth(server: &mut DuplexStream, size: (u16, u16), password: bool) {
+    handshake_named(server, size, password, "test").await;
+}
+
+async fn handshake_named(server: &mut DuplexStream, size: (u16, u16), password: bool, name: &str) {
     server.write_all(b"RFB 003.008\n").await.unwrap();
     let mut version = [0; 12];
     server.read_exact(&mut version).await.unwrap();
@@ -40,8 +44,8 @@ async fn handshake_auth(server: &mut DuplexStream, size: (u16, u16), password: b
         .write_all(&Vec::<u8>::from(PixelFormat::rgba()))
         .await
         .unwrap();
-    server.write_u32(4).await.unwrap();
-    server.write_all(b"test").await.unwrap();
+    server.write_u32(name.len() as u32).await.unwrap();
+    server.write_all(name.as_bytes()).await.unwrap();
     let mut pixel_format = [0; 20];
     server.read_exact(&mut pixel_format).await.unwrap();
     assert_eq!(pixel_format[0], 0);
@@ -373,5 +377,22 @@ async fn builder_rejects_unqualified_codecs_and_invalid_pixel_shifts() {
             .add_encoding(VncEncoding::Raw)
             .build()
             .is_err());
+    }
+}
+
+#[tokio::test]
+async fn server_name_is_available_without_draining_frames_and_survives_clone() {
+    for name in ["", "Test workstation ÆØÅ"] {
+        let (client_stream, mut server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            handshake_named(&mut server, (2, 2), false, name).await;
+            server
+        });
+        let client = connect(client_stream).await;
+        let _server = server_task.await.unwrap();
+        assert_eq!(client.server_name(), name);
+        let clone = client.clone();
+        client.close().await.unwrap();
+        assert_eq!(clone.server_name(), name);
     }
 }
